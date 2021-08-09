@@ -4,6 +4,7 @@ import argparse
 import os
 import json
 from typing import Any
+from pathlib import Path
 from tqdm.auto import tqdm
 from collections import defaultdict
 import zipfile
@@ -47,14 +48,53 @@ class Row:
 def mkey(row: Row):
     return (row.term, row.reading)
 
+def copy_content(older_copy:defaultdict, indir, prefix, izf: zipfile.ZipFile, ozf: zipfile.ZipFile, data):
+    if type(data) == str:
+        return data
+    elif type(data) == list:
+        return [copy_content(older_copy, indir, prefix, izf, ozf, i) for i in data]
+    elif type(data) == dict:
+        if "path" in data:
+            p = Path(data["path"])
+            outfile = str(prefix / p)
+            infile = str(p)
+            if outfile not in older_copy[infile]:
+                with izf.open(infile) as fd:
+                    with ozf.open(outfile, 'w') as ofd:
+                        while True:
+                            a = fd.read(1024)
+                            if a == b'':
+                                break
+                            ofd.write(a)
+                # print(f'copied {p} to {outfile}')
+                older_copy[infile].append(outfile)
+            else:
+                # print(f'skipping {p}')
+                pass
+            data["path"] = str(outfile)
+        if "type" in data and data["type"] == "structured-content":
+            data["content"] = copy_content(older_copy, indir, prefix, izf, ozf, data["content"])
+        
+        return data
+    elif type(data) == Row:
+        data.definition == copy_content(older_copy, indir, prefix, izf, ozf, data.definition)
+        return data
+    print(type(data))
+    raise "unhanled"
+
 def main(input_dicts, output_dict, policy):
+    ozf = zipfile.ZipFile(output_dict, "w"
+            #, compression=zipfile.ZIP_DEFLATED, compresslevel=9
+    )
     policy_or = policy == 'or'
     policy_and = policy == 'and'
     print('runing with policy ', policy)
     index = Index()
     data = defaultdict(lambda: [])
-    for d in tqdm(input_dicts):
+    copy_db = defaultdict(lambda: [])
+    for (di, d) in tqdm(list(enumerate(input_dicts))):
         print(d)
+        local_data = defaultdict(lambda: [])
         with zipfile.ZipFile(d, "r") as zf:
             broken = 5
             entries = 0
@@ -74,17 +114,20 @@ def main(input_dicts, output_dict, policy):
                         for row in rows:
                             r = Row(*row)
                             key = mkey(r)
-                            if (policy == 'or' and key not in data) or (policy == 'and'):
-                                data[key].append(r)
+                            
+                            local_data[key].append(r)
                             # if r.term == '読む':
                             #     print(r.serializable())
                             if r.inflection_rule == 'v1 v5' and broken > 0:
                                 broken -= 1
                                 print(r.serializable())
-
                         entries += len(rows)
+            for (k, v) in local_data.items():
+                if (policy == 'or' and k not in data) or (policy == 'and'):
+                    v = copy_content(copy_db, d, str(di), zf, ozf, v)
+                    data[k].extend(v)
 
-            # print('with ', entries, ' entries')
+                # print('with ', entries, ' entries')
     index.title = f'({index.title})'
     index.revision = f'({index.revision})'
 
@@ -107,21 +150,19 @@ def main(input_dicts, output_dict, policy):
             print(r.serializable())
     fixed_data = sorted(fixed_data, key=lambda x: x.frequency, reverse=True)
     fixed_data = list(map(Row.serializable, fixed_data))
-    with zipfile.ZipFile(output_dict, "w"
-            #, compression=zipfile.ZIP_DEFLATED, compresslevel=9
-    ) as zf:
-        with zf.open('index.json', "w") as fd:
-            fd.write(json.dumps(index.serializable(), ensure_ascii=False).encode('utf8'))
-        print(index.serializable())
-        i = 0
-        f_count = 1
-        while i < len(fixed_data) - 1:
-            ni = min(i + 10000, len(fixed_data))
-            with zf.open(f'term_bank_{f_count}.json', 'w') as fd:
-                fd.write(json.dumps(fixed_data[i: ni], ensure_ascii=False, sort_keys=True, indent=2).encode('utf8'))
-            i = ni
-            f_count += 1
 
+    with ozf.open('index.json', "w") as fd:
+        fd.write(json.dumps(index.serializable(), ensure_ascii=False).encode('utf8'))
+    print(index.serializable())
+    i = 0
+    f_count = 1
+    while i < len(fixed_data) - 1:
+        ni = min(i + 10000, len(fixed_data))
+        with ozf.open(f'term_bank_{f_count}.json', 'w') as fd:
+            fd.write(json.dumps(fixed_data[i: ni], ensure_ascii=False, sort_keys=True, indent=2).encode('utf8'))
+        i = ni
+        f_count += 1
+    ozf.close()
     print('with ', len(fixed_data), ' entries')
 parser = argparse.ArgumentParser(description='merge dicts')
 parser.add_argument('dictionary', type=str, nargs='+',
